@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from app.services.base import BaseModuleService, _ensure_dir
+from app.services.page_version import V2
 from app.store import store
 
 
@@ -109,6 +110,34 @@ class FormatParseService(BaseModuleService):
                 })
             written = self._write_jsonl(output_path, parsed_records)
 
+            # 同步登记带版本的 v2 解析页记录。新解析出的代次默认「未确认」，
+            # 必须显式确认后才允许分块切分消费，避免补页悄悄掺入已确认输入。
+            page_version = str(task.get("页版本") or "v2")
+            page_svc = self._safe_import(
+                "app.services.page_version", "PageVersionService"
+            )()
+            versioned = page_svc.write_versioned_pages(
+                doc_id,
+                page_version,
+                [
+                    {
+                        "page_num": p["page"],
+                        "paragraphs": p["paragraphs"],
+                        "text_length": p["text_length"],
+                        "has_tables": p["has_tables"],
+                        "has_images": p["has_images"],
+                        "parser": parser,
+                        "content_hash": next(
+                            r["content_hash"] for r in parsed_records
+                            if r["page_num"] == p["page"]
+                        ),
+                    }
+                    for p in pages
+                ],
+                source="format_parse",
+                confirmed=False,
+            )
+
             # 写入表格区域到共享产物，供table_extract读取
             if table_regions:
                 table_path = self._data_dir("layout") / f"{doc_id}_tables.jsonl"
@@ -135,6 +164,10 @@ class FormatParseService(BaseModuleService):
                 "elapsed": elapsed,
                 "table_count": len(table_regions),
                 "image_count": len(image_regions),
+                "page_version": V2,
+                "version": page_version,
+                "versioned_pages_path": versioned["path"],
+                "version_confirmed": False,
             })
 
             # 跨模块自动触发
@@ -154,12 +187,62 @@ class FormatParseService(BaseModuleService):
 # 【数据工程】解析操作完成后触发下游分块数据集消费
                 "elapsed": round(elapsed, 2),
                 "output": str(output_path),
+                "versioned_pages": versioned,
                 "triggers": triggers,
             }
         except Exception as e:
             task["status"] = "解析失败"
             task["abnormal"] = True
             return {"task_id": task_id, "error": str(e), "doc_id": doc_id}
+
+    def produce_supplemental_pages(
+        self,
+        doc_id: str,
+        version: str,
+        *,
+        page_nums: list[int] | None = None,
+        parser: str = "PDF",
+        paragraphs_per_page: int = 6,
+    ) -> dict[str, Any]:
+        """同一文档再次解析：生成另一代带版本补页（默认未确认，不覆盖任何既有代次）。"""
+        from app.services.page_version import PageVersionService
+
+        page_svc = PageVersionService()
+        existing_nums = {
+            p["page_num"]
+            for v in page_svc.list_versions(doc_id)
+            for p in page_svc.read_versioned_pages(doc_id, v["version"])
+        }
+        if page_nums is None:
+            # 默认补一批与既有页号不重叠的新页，模拟增量补页。
+            start = (max(existing_nums) if existing_nums else 0) + 1
+            page_nums = [start, start + 1]
+
+        pages = []
+        for num in page_nums:
+            content = self._simulate_doc_content(f"{doc_id}#{version}", paragraphs=paragraphs_per_page)
+            text = "\n".join(content)
+            pages.append({
+                "page_num": num,
+                "paragraphs": content,
+                "text_length": len(text),
+                "has_tables": num % 2 == 1,
+                "has_images": num % 2 == 0,
+                "parser": parser,
+                "content_hash": self._compute_checksum(text),
+                "page_summary": f"supplemental {version} page {num}",
+            })
+        result = page_svc.write_versioned_pages(
+            doc_id, version, pages, source="format_parse.supplemental", confirmed=False
+        )
+        self._write_checkpoint(f"parse_supplemental_{doc_id}_{version}", {
+            "doc_id": doc_id,
+            "version": version,
+            "pages": len(pages),
+            "page_nums": page_nums,
+            "confirmed": False,
+        })
+        return result
 
     def _simulate_pages(self, content: list[str]) -> list[dict[str, Any]]:
         """模拟将文本内容切分为多页文档，每页含段落、表格和图片区域标记。"""

@@ -20,6 +20,7 @@ from app.services.doc_version import DocVersionService
 from app.services.extract_lineage import ExtractLineageService
 from app.services.result_deliver import ResultDeliverService
 from app.services.parse_retry import ParseRetryService
+from app.services.page_version import PageVersionService
 
 SERVICES: dict[str, BaseModuleService] = {
     "file_intake": FileIntakeService(),
@@ -40,6 +41,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "extract_lineage": ExtractLineageService(),
     "result_deliver": ResultDeliverService(),
     "parse_retry": ParseRetryService(),
+    "page_version": PageVersionService(),
 }
 
 

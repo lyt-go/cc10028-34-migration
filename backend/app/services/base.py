@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import threading
 import time
 import importlib
 from pathlib import Path
@@ -140,6 +141,38 @@ class BaseModuleService:
                     except json.JSONDecodeError:
                         continue
         return records
+
+    def _write_jsonl_atomic(self, filepath: Path, records: list[dict[str, Any]]) -> int:
+        """先写临时文件再os.replace整体替换，保证迁移/切换中断时不会出现半写产物。"""
+        _ensure_dir(filepath.parent)
+        tmp = filepath.with_name(
+            f".{filepath.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        with open(tmp, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        os.replace(tmp, filepath)
+        return len(records)
+
+    def _write_json_atomic(self, filepath: Path, payload: dict[str, Any]) -> None:
+        """原子写入JSON状态文件（迁移状态、切分清单等），避免中断产生损坏状态。"""
+        _ensure_dir(filepath.parent)
+        tmp = filepath.with_name(
+            f".{filepath.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        os.replace(tmp, filepath)
+
+    def _read_json(self, filepath: Path) -> dict[str, Any] | None:
+        """读取JSON文件，不存在或损坏均返回None，供中断恢复路径安全调用。"""
+        if not filepath.exists():
+            return None
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
 
     def _write_checkpoint(self, name: str, state: dict[str, Any]) -> Path:
         """写入检查点文件，用于中断恢复与游标推进。检查点记录当前处理偏移和状态。"""
